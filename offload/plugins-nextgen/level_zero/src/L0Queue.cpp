@@ -11,10 +11,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "L0Queue.h"
+#include "DLWrap.h"
 #include "L0Device.h"
 #include "L0Kernel.h"
 #include "L0Plugin.h"
+#include "OffloadError.h"
+#include "PluginInterface.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/Error.h"
 
 namespace llvm::omp::target::plugin {
 
@@ -48,10 +52,37 @@ Error L0QueueTy::dispatchLaunchKernel(ze_kernel_handle_t Kernel,
                                       ze_event_handle_t *WaitEvents) {
   // Unlock KEnv lock after launching the kernel.
   llvm::scope_exit UnlockGuard([&KEnv]() { KEnv.Lock.unlock(); });
-  if (KEnv.IsPtrArg)
+
+  auto CanUseArgPtr =
+      dlwrap::loaded<zeCommandListAppendLaunchKernelWithArguments>();
+  if (KEnv.IsPtrArg && CanUseArgPtr)
     return CmdList->appendLaunchKernelWithArgs(
         Kernel, &KEnv.GroupCounts, &KEnv.GroupSizes, KEnv.ArgPtrs, SignalEvent,
         NumWaitEvents, WaitEvents, KEnv.IsCooperative);
+
+  // Arguments were provided but we have an old level zero version
+  if (KEnv.IsPtrArg) {
+    auto &GroupSizes = KEnv.GroupSizes;
+    auto Res =
+        zeKernelSetGroupSize(Kernel, GroupSizes.groupSizeX,
+                             GroupSizes.groupSizeY, GroupSizes.groupSizeZ);
+    if (Res != ZE_RESULT_SUCCESS)
+      return error::createOffloadError(ErrorCode::UNKNOWN,
+                                       "Could not set group size!");
+
+    auto &KernelProperties = KEnv.KernelPR;
+
+    for (uint32_t KernelArg = 0; KernelArg < KernelProperties.NumKernelArgs;
+         KernelArg++) {
+      uint32_t ArgSize = KernelProperties.ArgSizes[KernelArg];
+
+      Res = zeKernelSetArgumentValue(Kernel, KernelArg, ArgSize,
+                                     KEnv.ArgPtrs[KernelArg]);
+      if (Res != ZE_RESULT_SUCCESS)
+        return error::createOffloadError(ErrorCode::UNKNOWN,
+                                         "Could not set argument to a kernel!");
+    }
+  }
 
   return CmdList->appendLaunchKernel(Kernel, &KEnv.GroupCounts, SignalEvent,
                                      NumWaitEvents, WaitEvents,
